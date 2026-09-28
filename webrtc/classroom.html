@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Classroom - Lớp học trực tuyến</title>
+<style>
+*{box-sizing:border-box}body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f3f6fb;color:#192a46}.top{background:#192a46;color:white;padding:16px 22px;display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}.brand{font-weight:800;font-size:19px}.status{background:#ffffff1f;border-radius:999px;padding:7px 12px;font-size:13px}.wrap{max-width:1320px;margin:auto;padding:18px}.info{display:flex;gap:20px;flex-wrap:wrap;background:white;border:1px solid #e2e7ef;border-radius:12px;padding:12px 15px;margin-bottom:14px}.layout{display:grid;grid-template-columns:360px 1fr;gap:14px}.card{background:white;border:1px solid #e2e7ef;border-radius:12px;padding:14px;box-shadow:0 4px 18px #0000000c}.card h3{margin:0 0 10px}.local video{width:100%;aspect-ratio:16/9;background:#111;border-radius:9px}.remoteGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;min-height:320px}.tile{background:#101828;border-radius:11px;padding:8px;color:white;position:relative}.tile video{width:100%;aspect-ratio:16/9;background:#000;border-radius:8px}.tile .name{padding:7px 3px 2px;font-weight:700;font-size:13px}.empty{color:#667085;display:grid;place-items:center;min-height:280px;border:2px dashed #d6dce7;border-radius:10px}.controls{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap}.controls button{border:0;border-radius:8px;padding:10px 14px;font-weight:700;cursor:pointer;background:#3474eb;color:white}.controls button.secondary{background:#e9eef7;color:#192a46}.controls button.danger{background:#d92d20}.controls button:disabled{opacity:.5;cursor:not-allowed}.hint{font-size:13px;color:#667085;line-height:1.5}.ok{color:#27ae60}.warn{color:#f79009}.error{color:#f04438}.pill{display:inline-block;background:#edf4ff;color:#2457b8;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:700}.studentMode .layout{grid-template-columns:1fr}.studentMode .local{max-width:430px}.studentMode #remoteTitle{font-size:18px}@media(max-width:900px){.layout{grid-template-columns:1fr}.local{max-width:none}}
+</style>
+</head>
+<body>
+<div class="top"><div class="brand">LỚP HỌC TRỰC TUYẾN - WEBRTC</div><div id="status" class="status">Đang khởi tạo...</div></div>
+<div class="wrap" id="root">
+  <div class="info">
+    <div><b>Tài khoản:</b> <span id="me">-</span></div>
+    <div><b>Phòng:</b> <span id="room">-</span></div>
+    <div><b>Vai trò:</b> <span id="mode" class="pill">-</span></div>
+    <div><b>Giáo viên:</b> <span id="teacher">-</span></div>
+  </div>
+
+  <div class="layout">
+    <div class="card local">
+      <h3>Camera của tôi</h3>
+      <video id="local" autoplay muted playsinline></video>
+      <div class="controls">
+        <button id="media">Bật Camera / Microphone</button>
+        <button id="toggleMic" class="secondary" disabled>Tắt Microphone</button>
+        <button id="toggleCam" class="secondary" disabled>Tắt Camera</button>
+      </div>
+      <p class="hint">Camera và microphone chỉ được gửi qua WebRTC sau khi kết nối. Signaling được chuyển qua UDP Server của đồ án.</p>
+    </div>
+
+    <div class="card">
+      <h3 id="remoteTitle">Người tham gia</h3>
+      <div id="remoteGrid" class="remoteGrid"><div class="empty" id="empty">Đang chờ người tham gia...</div></div>
+      <div class="controls">
+        <button id="begin" disabled>Bắt đầu phát cho cả lớp</button>
+        <button id="end" class="danger">Kết thúc / Rời buổi học</button>
+      </div>
+      <p class="hint" id="help"></p>
+    </div>
+  </div>
+</div>
+<script>
+let info={username:'',room:'',mode:'student',teacher:''};
+let localStream=null;
+let mediaReady=false;
+let classStarted=false;
+let ended=false;
+const peers=new Map();
+const pendingOffers=[];
+const localVideo=document.getElementById('local');
+const grid=document.getElementById('remoteGrid');
+const statusEl=document.getElementById('status');
+const btnMedia=document.getElementById('media');
+const btnBegin=document.getElementById('begin');
+const btnEnd=document.getElementById('end');
+const btnMic=document.getElementById('toggleMic');
+const btnCam=document.getElementById('toggleCam');
+
+function setStatus(text,cls=''){statusEl.textContent=text;statusEl.className='status '+cls;}
+function escId(s){return 'peer_'+btoa(unescape(encodeURIComponent(s))).replace(/[^a-zA-Z0-9]/g,'');}
+function rtcConfig(){return {iceServers:[{urls:'stun:stun.l.google.com:19302'}]};}
+
+async function loadInfo(){
+  const r=await fetch('/class-info',{cache:'no-store'}); info=await r.json();
+  document.getElementById('me').textContent=info.username||'-';
+  document.getElementById('room').textContent=info.room||'-';
+  document.getElementById('teacher').textContent=info.teacher||info.username||'-';
+  document.getElementById('mode').textContent=info.mode==='teacher'?'GIÁO VIÊN':'HỌC SINH';
+  if(info.mode==='student'){
+    document.getElementById('root').classList.add('studentMode');
+    document.getElementById('remoteTitle').textContent='Bài giảng của giáo viên';
+    document.getElementById('empty').textContent='Đang chờ video từ giáo viên...';
+    btnBegin.style.display='none';
+    document.getElementById('help').textContent='Bạn sẽ thấy camera của giáo viên ở đây. Giáo viên có thể thấy camera của bạn nếu bạn bật Camera/Microphone.';
+    setStatus('Đã nhận lời mời - hãy bật Camera/Microphone','ok');
+  }else{
+    document.getElementById('help').textContent='Giáo viên phát video đến từng học sinh bằng các kết nối WebRTC P2P riêng. Học sinh mới chấp nhận sẽ tự được thêm vào.';
+    setStatus('Đang chờ học sinh chấp nhận lời mời...');
+  }
+}
+
+async function startMedia(){
+  try{
+    if(!localStream){
+      localStream=await navigator.mediaDevices.getUserMedia({video:true,audio:true});
+      localVideo.srcObject=localStream;
+    }
+    mediaReady=true; btnMedia.disabled=true; btnMic.disabled=false; btnCam.disabled=false;
+    if(info.mode==='teacher'){
+      btnBegin.disabled=false; setStatus('Camera đã sẵn sàng - nhấn Bắt đầu phát cho cả lớp','ok');
+    }else{
+      setStatus('Camera đã sẵn sàng - đang chờ kết nối từ giáo viên','ok');
+      while(pendingOffers.length){const x=pendingOffers.shift();await acceptOffer(x.from,x.signal);}
+    }
+  }catch(e){setStatus('Không mở được Camera/Microphone','error');alert('Không mở được Camera/Microphone. Hãy cấp quyền cho trình duyệt.\n\n'+e);}
+}
+
+function addLocalTracks(pc){if(localStream)localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));}
+function ensureRemoteTile(name){
+  const id=escId(name); let v=document.getElementById(id);
+  if(v)return v;
+  const empty=document.getElementById('empty'); if(empty)empty.remove();
+  const tile=document.createElement('div'); tile.className='tile'; tile.dataset.peer=name;
+  v=document.createElement('video'); v.id=id; v.autoplay=true; v.playsInline=true;
+  const n=document.createElement('div'); n.className='name'; n.textContent=name;
+  tile.appendChild(v); tile.appendChild(n); grid.appendChild(tile); return v;
+}
+function removeRemoteTile(name){const el=grid.querySelector('[data-peer="'+CSS.escape(name)+'"]');if(el)el.remove();if(!grid.children.length){const e=document.createElement('div');e.id='empty';e.className='empty';e.textContent=info.mode==='teacher'?'Đang chờ người tham gia...':'Đang chờ video từ giáo viên...';grid.appendChild(e);}}
+
+function makePeer(target){
+  if(peers.has(target))return peers.get(target);
+  const pc=new RTCPeerConnection(rtcConfig());
+  addLocalTracks(pc);
+  pc.ontrack=e=>{const v=ensureRemoteTile(target);if(e.streams&&e.streams[0])v.srcObject=e.streams[0];};
+  pc.onconnectionstatechange=()=>{
+    const s=pc.connectionState;
+    if(s==='connected')setStatus(info.mode==='teacher'?'Đang giảng bài - WebRTC đã kết nối':'Đã kết nối với giáo viên','ok');
+    if(s==='failed'||s==='closed'){removePeer(target);}
+  };
+  peers.set(target,pc); return pc;
+}
+function removePeer(target){const pc=peers.get(target);if(pc){try{pc.close();}catch(e){}peers.delete(target);}removeRemoteTile(target);}
+
+function waitIceComplete(pc){
+  if(pc.iceGatheringState==='complete')return Promise.resolve();
+  return new Promise(resolve=>{let done=false;const finish=()=>{if(done)return;done=true;pc.removeEventListener('icegatheringstatechange',check);resolve();};const check=()=>{if(pc.iceGatheringState==='complete')finish();};pc.addEventListener('icegatheringstatechange',check);setTimeout(finish,4500);});
+}
+async function postSignal(target,obj){
+  const r=await fetch('/class-signal?target='+encodeURIComponent(target),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});
+  if(!r.ok)throw new Error(await r.text());
+}
+async function offerTo(target){
+  if(!mediaReady||ended||peers.has(target))return;
+  try{
+    const pc=makePeer(target); await pc.setLocalDescription(await pc.createOffer()); await waitIceComplete(pc);
+    await postSignal(target,{type:'offer',sdp:pc.localDescription.sdp});
+    setStatus('Đã gửi kết nối đến '+target+' - chờ phản hồi...');
+  }catch(e){removePeer(target);console.error(e);setStatus('Không kết nối được '+target,'error');}
+}
+async function acceptOffer(from,sig){
+  if(!mediaReady){pendingOffers.push({from,signal:sig});setStatus('Giáo viên đã bắt đầu - hãy bật Camera/Microphone','warn');return;}
+  try{
+    const pc=makePeer(from); await pc.setRemoteDescription({type:'offer',sdp:sig.sdp});
+    await pc.setLocalDescription(await pc.createAnswer()); await waitIceComplete(pc);
+    await postSignal(from,{type:'answer',sdp:pc.localDescription.sdp});
+    setStatus('Đang kết nối với giáo viên...');
+  }catch(e){console.error(e);setStatus('Không nhận được luồng WebRTC','error');}
+}
+async function handleEnvelope(env){
+  if(!env||!env.signal)return; const from=env.from||''; const sig=env.signal;
+  if(sig.type==='hangup-all'){endLocal(false);setStatus('Buổi học đã kết thúc','warn');return;}
+  if(sig.type==='hangup'){removePeer(from);if(info.mode==='student'){endLocal(false);setStatus('Giáo viên đã kết thúc kết nối','warn');}return;}
+  if(info.mode==='teacher'&&sig.type==='answer'){
+    const pc=peers.get(from); if(!pc)return;
+    try{await pc.setRemoteDescription({type:'answer',sdp:sig.sdp});}catch(e){console.error(e);}
+  }else if(info.mode==='student'&&sig.type==='offer'){
+    await acceptOffer(from,sig);
+  }
+}
+async function pollSignals(){
+  if(ended)return;
+  try{const r=await fetch('/class-signal',{cache:'no-store'});if(r.status===200){await handleEnvelope(await r.json());}}catch(e){}
+}
+async function pollParticipants(){
+  if(info.mode!=='teacher'||ended)return;
+  try{
+    const r=await fetch('/class-participants',{cache:'no-store'}); const arr=await r.json();
+    document.getElementById('remoteTitle').textContent='Học sinh đang tham gia ('+arr.length+')';
+    if(classStarted)arr.forEach(name=>{if(!peers.has(name))offerTo(name);});
+    for(const name of [...peers.keys()])if(!arr.includes(name))removePeer(name);
+  }catch(e){}
+}
+async function beginClass(){
+  if(!mediaReady)await startMedia();
+  classStarted=true; btnBegin.disabled=true; setStatus('Đang phát lời mời WebRTC đến học sinh...');
+  await pollParticipants();
+}
+function endLocal(notify=true){
+  if(ended)return; ended=true;
+  if(notify)fetch('/class-end',{method:'POST'}).catch(()=>{});
+  for(const [name,pc] of peers){try{pc.close();}catch(e){}} peers.clear();
+  if(localStream){localStream.getTracks().forEach(t=>t.stop());localStream=null;}
+  localVideo.srcObject=null; grid.innerHTML='<div class="empty">Buổi học đã kết thúc</div>';
+  btnBegin.disabled=true;btnMedia.disabled=true;btnMic.disabled=true;btnCam.disabled=true;
+}
+btnMedia.onclick=startMedia;
+btnBegin.onclick=beginClass;
+btnEnd.onclick=()=>{endLocal(true);setStatus(info.mode==='teacher'?'Đã kết thúc lớp học':'Đã rời buổi học','warn');};
+btnMic.onclick=()=>{if(!localStream)return;const t=localStream.getAudioTracks()[0];if(!t)return;t.enabled=!t.enabled;btnMic.textContent=t.enabled?'Tắt Microphone':'Bật Microphone';};
+btnCam.onclick=()=>{if(!localStream)return;const t=localStream.getVideoTracks()[0];if(!t)return;t.enabled=!t.enabled;btnCam.textContent=t.enabled?'Tắt Camera':'Bật Camera';};
+window.addEventListener('beforeunload',()=>{if(!ended)navigator.sendBeacon('/class-end','1');});
+(async()=>{try{await loadInfo();setInterval(pollSignals,350);setInterval(pollParticipants,700);}catch(e){setStatus('Không kết nối được với ứng dụng Smart Classroom','error');console.error(e);}})();
+</script>
+</body>
+</html>

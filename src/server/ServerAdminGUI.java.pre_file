@@ -1,0 +1,889 @@
+package server;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import javax.swing.table.DefaultTableModel;
+import java.awt.*;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.List;
+import java.util.concurrent.*;
+
+/**
+ * Smart Classroom - UDP Server with Admin GUI.
+ * Pure Java Swing + DatagramSocket, suitable for a Network Programming midterm demo.
+ */
+public class ServerAdminGUI extends JFrame {
+    private static final int DEFAULT_PORT = 5000;
+    private static final int BUFFER_SIZE = 65507;
+    private static final long OFFLINE_TIMEOUT_MS = 12_000;
+
+    private final Color NAVY = new Color(25, 42, 70);
+    private final Color BLUE = new Color(52, 116, 235);
+    private final Color GREEN = new Color(33, 150, 83);
+    private final Color RED = new Color(211, 47, 47);
+    private final Color BG = new Color(245, 247, 251);
+
+    private final JTextField txtServerIp = new JTextField(15);
+    private final JTextField txtPort = new JTextField(String.valueOf(DEFAULT_PORT), 7);
+    private final JLabel lblStatus = new JLabel("ĐÃ DỪNG");
+    private final JLabel lblLanIp = new JLabel("-");
+    private final JLabel lblClientCount = new JLabel("0");
+    private final JLabel lblRoomCount = new JLabel("0");
+    private final JButton btnAutoIp = new JButton("Tự động");
+    private final JButton btnStartStop = new JButton("Khởi động Server");
+    private final JButton btnKick = new JButton("Mời người dùng ra khỏi lớp");
+    private final JButton btnBroadcast = new JButton("Gửi thông báo toàn hệ thống");
+    private final JButton btnCloseRoom = new JButton("Đóng phòng đã chọn");
+    private final JTextArea logArea = new JTextArea();
+
+    private final DefaultTableModel userModel = new DefaultTableModel(
+            new Object[]{"Tên người dùng", "Vai trò", "Địa chỉ IP", "Cổng", "Phòng", "Hoạt động gần nhất"}, 0) {
+        @Override public boolean isCellEditable(int row, int column) { return false; }
+    };
+    private final JTable userTable = new JTable(userModel);
+
+    private final DefaultTableModel roomModel = new DefaultTableModel(
+            new Object[]{"Mã phòng", "Giáo viên", "Thành viên", "Đã điểm danh"}, 0) {
+        @Override public boolean isCellEditable(int row, int column) { return false; }
+    };
+    private final JTable roomTable = new JTable(roomModel);
+
+    private final Map<String, ClientInfo> clients = new ConcurrentHashMap<>();
+    private final Map<String, Room> rooms = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private volatile boolean running = false;
+    private DatagramSocket socket;
+    private Thread receiveThread;
+    private int serverPort = DEFAULT_PORT;
+
+    private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss");
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            try {
+                UIManager.setLookAndFeel("javax.swing.plaf.nimbus.NimbusLookAndFeel");
+            } catch (Exception ignored) {}
+            new ServerAdminGUI().setVisible(true);
+        });
+    }
+
+    public ServerAdminGUI() {
+        setTitle("Smart Classroom - Quản trị Server");
+        setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
+        setMinimumSize(new Dimension(1080, 700));
+        setSize(1180, 760);
+        setLocationRelativeTo(null);
+        buildUI();
+        String detectedIp = findLanIp();
+        txtServerIp.setText(detectedIp);
+        lblLanIp.setText(detectedIp);
+
+        addWindowListener(new WindowAdapter() {
+            @Override public void windowClosing(WindowEvent e) {
+                int result = JOptionPane.showConfirmDialog(ServerAdminGUI.this,
+                        "Dừng Server và thoát chương trình?", "Xác nhận thoát", JOptionPane.YES_NO_OPTION);
+                if (result == JOptionPane.YES_OPTION) {
+                    stopServer("Ứng dụng Server đã đóng");
+                    scheduler.shutdownNow();
+                    dispose();
+                }
+            }
+        });
+
+        scheduler.scheduleAtFixedRate(this::removeOfflineClients, 4, 4, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(() -> SwingUtilities.invokeLater(this::refreshTables),
+                1, 1, TimeUnit.SECONDS);
+    }
+
+    private void buildUI() {
+        JPanel root = new JPanel(new BorderLayout());
+        root.setBackground(BG);
+        setContentPane(root);
+
+        JPanel header = new JPanel(new BorderLayout(16, 0));
+        header.setBackground(NAVY);
+        header.setBorder(new EmptyBorder(18, 22, 18, 22));
+
+        JPanel titlePanel = new JPanel(new GridLayout(0, 1));
+        titlePanel.setOpaque(false);
+        JLabel title = new JLabel("MÁY CHỦ LỚP HỌC TRỰC TUYẾN");
+        title.setForeground(Color.WHITE);
+        title.setFont(new Font("Segoe UI", Font.BOLD, 24));
+        JLabel subtitle = new JLabel("Bảng điều khiển quản trị UDP Client-Server");
+        subtitle.setForeground(new Color(210, 220, 238));
+        subtitle.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        titlePanel.add(title);
+        titlePanel.add(subtitle);
+        header.add(titlePanel, BorderLayout.WEST);
+
+        JPanel serverActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 2));
+        serverActions.setOpaque(false);
+
+        JLabel ipLabel = labelWhite("IP Server:");
+        serverActions.add(ipLabel);
+        txtServerIp.setFont(new Font("Segoe UI", Font.PLAIN, 14));
+        txtServerIp.setToolTipText("Nhập IPv4 của máy Server để các Client sử dụng, ví dụ 172.20.10.3");
+        serverActions.add(txtServerIp);
+
+        styleSecondary(btnAutoIp);
+        btnAutoIp.setToolTipText("Tự động dò lại địa chỉ IPv4 LAN");
+        serverActions.add(btnAutoIp);
+
+        JLabel portLabel = labelWhite("Cổng:");
+        serverActions.add(portLabel);
+        txtPort.setFont(new Font("Segoe UI", Font.PLAIN, 14));
+        serverActions.add(txtPort);
+        stylePrimary(btnStartStop);
+        serverActions.add(btnStartStop);
+        header.add(serverActions, BorderLayout.EAST);
+        root.add(header, BorderLayout.NORTH);
+
+        JPanel body = new JPanel(new BorderLayout(12, 12));
+        body.setBackground(BG);
+        body.setBorder(new EmptyBorder(14, 16, 16, 16));
+
+        JPanel stats = new JPanel(new GridLayout(1, 4, 12, 0));
+        stats.setOpaque(false);
+        stats.add(statCard("Trạng thái Server", lblStatus));
+        stats.add(statCard("IP Client kết nối", lblLanIp));
+        stats.add(statCard("Người dùng trực tuyến", lblClientCount));
+        stats.add(statCard("Phòng đang hoạt động", lblRoomCount));
+        body.add(stats, BorderLayout.NORTH);
+
+        JTabbedPane tabs = new JTabbedPane();
+        tabs.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        tabs.addTab("Người dùng trực tuyến", buildUsersPanel());
+        tabs.addTab("Phòng học", buildRoomsPanel());
+        tabs.addTab("Nhật ký Server", buildLogPanel());
+        body.add(tabs, BorderLayout.CENTER);
+
+        root.add(body, BorderLayout.CENTER);
+
+        btnAutoIp.addActionListener(e -> {
+            if (running) return;
+            String detected = findLanIp();
+            txtServerIp.setText(detected);
+            lblLanIp.setText(detected);
+        });
+
+        btnStartStop.addActionListener(e -> {
+            if (running) stopServer("Đã dừng bởi quản trị viên");
+            else startServer();
+        });
+        btnKick.addActionListener(e -> kickSelectedUser());
+        btnBroadcast.addActionListener(e -> broadcastDialog());
+        btnCloseRoom.addActionListener(e -> closeSelectedRoom());
+    }
+
+    private JPanel buildUsersPanel() {
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(new EmptyBorder(10, 10, 10, 10));
+        userTable.setRowHeight(28);
+        userTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        panel.add(new JScrollPane(userTable), BorderLayout.CENTER);
+
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        styleDanger(btnKick);
+        styleSecondary(btnBroadcast);
+        actions.add(btnBroadcast);
+        actions.add(btnKick);
+        panel.add(actions, BorderLayout.SOUTH);
+        return panel;
+    }
+
+    private JPanel buildRoomsPanel() {
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(new EmptyBorder(10, 10, 10, 10));
+        roomTable.setRowHeight(28);
+        roomTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        panel.add(new JScrollPane(roomTable), BorderLayout.CENTER);
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        styleDanger(btnCloseRoom);
+        actions.add(btnCloseRoom);
+        panel.add(actions, BorderLayout.SOUTH);
+        return panel;
+    }
+
+    private JPanel buildLogPanel() {
+        JPanel p = new JPanel(new BorderLayout());
+        p.setBorder(new EmptyBorder(10, 10, 10, 10));
+        logArea.setEditable(false);
+        logArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
+        logArea.setLineWrap(true);
+        logArea.setWrapStyleWord(true);
+        p.add(new JScrollPane(logArea), BorderLayout.CENTER);
+        return p;
+    }
+
+    private JPanel statCard(String caption, JLabel value) {
+        JPanel card = new JPanel(new BorderLayout(0, 6));
+        card.setBackground(Color.WHITE);
+        card.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(new Color(225, 230, 238)),
+                new EmptyBorder(12, 14, 12, 14)));
+        JLabel c = new JLabel(caption);
+        c.setForeground(new Color(100, 110, 125));
+        c.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        value.setFont(new Font("Segoe UI", Font.BOLD, 17));
+        value.setForeground(NAVY);
+        card.add(c, BorderLayout.NORTH);
+        card.add(value, BorderLayout.CENTER);
+        return card;
+    }
+
+    private JLabel labelWhite(String s) {
+        JLabel l = new JLabel(s);
+        l.setForeground(Color.WHITE);
+        l.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        return l;
+    }
+
+    private void stylePrimary(JButton b) {
+        b.setBackground(BLUE); b.setForeground(Color.WHITE);
+        b.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        b.setFocusPainted(false);
+    }
+    private void styleSecondary(JButton b) {
+        b.setBackground(new Color(236, 240, 247)); b.setForeground(NAVY);
+        b.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        b.setFocusPainted(false);
+    }
+    private void styleDanger(JButton b) {
+        b.setBackground(RED); b.setForeground(Color.WHITE);
+        b.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        b.setFocusPainted(false);
+    }
+
+    private void startServer() {
+        try {
+            int p = Integer.parseInt(txtPort.getText().trim());
+            if (p < 1024 || p > 65535) throw new IllegalArgumentException("Vui lòng sử dụng cổng từ 1024 đến 65535");
+            serverPort = p;
+
+            String clientConnectIp = txtServerIp.getText().trim();
+            if (clientConnectIp.isBlank()) {
+                clientConnectIp = findLanIp();
+                txtServerIp.setText(clientConnectIp);
+            }
+            InetAddress enteredAddress = InetAddress.getByName(clientConnectIp);
+            if (!(enteredAddress instanceof Inet4Address) || enteredAddress.isAnyLocalAddress()) {
+                throw new IllegalArgumentException("Vui lòng nhập một địa chỉ IPv4 hợp lệ, ví dụ 172.20.10.3");
+            }
+
+            socket = new DatagramSocket(null);
+            socket.setReuseAddress(true);
+            socket.bind(new InetSocketAddress("0.0.0.0", serverPort));
+            running = true;
+            txtServerIp.setEnabled(false);
+            btnAutoIp.setEnabled(false);
+            txtPort.setEnabled(false);
+            btnStartStop.setText("Dừng Server");
+            btnStartStop.setBackground(RED);
+            lblStatus.setText("ĐANG CHẠY");
+            lblStatus.setForeground(GREEN);
+            lblLanIp.setText(clientConnectIp);
+            log("Server đã khởi động tại 0.0.0.0:" + serverPort
+                    + " | IP Client sử dụng: " + clientConnectIp);
+
+            receiveThread = new Thread(this::receiveLoop, "udp-server-receiver");
+            receiveThread.setDaemon(true);
+            receiveThread.start();
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, ex.getMessage(), "Không thể khởi động Server", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void stopServer(String reason) {
+        if (!running) return;
+        running = false;
+        broadcastAll("SERVER_SHUTDOWN|" + clean(reason));
+        clients.clear();
+        rooms.clear();
+        if (socket != null && !socket.isClosed()) socket.close();
+        SwingUtilities.invokeLater(() -> {
+            txtServerIp.setEnabled(true);
+            btnAutoIp.setEnabled(true);
+            txtPort.setEnabled(true);
+            btnStartStop.setText("Khởi động Server");
+            btnStartStop.setBackground(BLUE);
+            lblStatus.setText("ĐÃ DỪNG");
+            lblStatus.setForeground(RED);
+            refreshTables();
+        });
+        log("Server đã dừng: " + reason);
+    }
+
+    private void receiveLoop() {
+        while (running) {
+            try {
+                byte[] buffer = new byte[BUFFER_SIZE];
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                socket.receive(packet);
+                String raw = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8).trim();
+                handlePacket(packet.getAddress(), packet.getPort(), raw);
+            } catch (SocketException e) {
+                if (running) log("Socket error: " + e.getMessage());
+                break;
+            } catch (Exception e) {
+                log("Receive error: " + e.getMessage());
+            }
+        }
+    }
+
+    private void handlePacket(InetAddress address, int port, String raw) {
+        String[] p = raw.split("\\|", -1);
+        String cmd = p[0].toUpperCase(Locale.ROOT);
+        try {
+            switch (cmd) {
+                case "LOGIN" -> login(address, port, p);
+                case "HEARTBEAT" -> heartbeat(address, port);
+                case "CREATE_ROOM" -> createRoom(address, port, p);
+                case "JOIN_ROOM" -> joinRoomCommand(address, port, p);
+                case "LEAVE_ROOM" -> leaveRoomCommand(address, port);
+                case "CHAT" -> chat(address, port, p);
+                case "ATTENDANCE" -> attendance(address, port);
+                case "RAISE_HAND" -> raiseHand(address, port);
+                case "QUIZ_START" -> startQuiz(address, port, p);
+                case "QUIZ_ANSWER" -> quizAnswer(address, port, p);
+                case "WEBRTC_CALL" -> webRtcCall(address, port, p);
+                case "WEBRTC_ACCEPT" -> webRtcAccept(address, port, p);
+                case "WEBRTC_REJECT" -> webRtcReject(address, port, p);
+                case "WEBRTC_SIGNAL" -> webRtcSignal(address, port, p);
+                case "WEBRTC_HANGUP" -> webRtcHangup(address, port, p);
+                case "WEBRTC_CLASS_CALL" -> webRtcClassCall(address, port);
+                case "WEBRTC_CLASS_ACCEPT" -> webRtcClassAccept(address, port, p);
+                case "WEBRTC_CLASS_REJECT" -> webRtcClassReject(address, port, p);
+                case "WEBRTC_CLASS_END" -> webRtcClassEnd(address, port);
+                case "LOGOUT" -> logout(address, port);
+                default -> send(address, port, "ERROR|Unknown command: " + clean(cmd));
+            }
+        } catch (Exception e) {
+            send(address, port, "ERROR|" + clean(e.getMessage()));
+        }
+    }
+
+    private void login(InetAddress a, int port, String[] p) {
+        if (p.length < 3) { send(a, port, "ERROR|LOGIN requires username and role"); return; }
+        String user = clean(p[1]);
+        String role = p[2].trim().toUpperCase(Locale.ROOT);
+        if (user.isBlank()) { send(a, port, "ERROR|Username cannot be empty"); return; }
+        if (!role.equals("TEACHER") && !role.equals("STUDENT")) role = "STUDENT";
+        ClientInfo old = clients.get(user);
+        if (old != null && !(old.address.equals(a) && old.port == port)) {
+            send(a, port, "ERROR|Username already in use"); return;
+        }
+        ClientInfo c = new ClientInfo(user, role, a, port);
+        clients.put(user, c);
+        send(c, "LOGIN_OK|" + user + "|" + role);
+        log("LOGIN  " + user + " [" + role + "] from " + a.getHostAddress() + ":" + port);
+        refreshTablesAsync();
+    }
+
+    private void heartbeat(InetAddress a, int port) {
+        ClientInfo c = byEndpoint(a, port);
+        if (c != null) c.lastSeen = System.currentTimeMillis();
+    }
+
+    private void createRoom(InetAddress a, int port, String[] p) {
+        ClientInfo c = requireClient(a, port); if (c == null) return;
+        if (!"TEACHER".equals(c.role)) { send(c, "ERROR|Only TEACHER can create a room"); return; }
+        if (p.length < 2 || clean(p[1]).isBlank()) { send(c, "ERROR|Room code cannot be empty"); return; }
+        String code = clean(p[1]).toUpperCase(Locale.ROOT);
+        Room room = new Room(code, c.username);
+        if (rooms.putIfAbsent(code, room) != null) { send(c, "ERROR|Room already exists"); return; }
+        moveClientToRoom(c, code);
+        send(c, "ROOM_CREATED|" + code);
+        broadcastRoom(code, "SYSTEM|" + c.username + " created room " + code);
+        sendUserList(code);
+        log("ROOM   " + code + " created by " + c.username);
+        refreshTablesAsync();
+    }
+
+    private void joinRoomCommand(InetAddress a, int port, String[] p) {
+        ClientInfo c = requireClient(a, port); if (c == null) return;
+        if (p.length < 2) { send(c, "ERROR|Room code is required"); return; }
+        String code = clean(p[1]).toUpperCase(Locale.ROOT);
+        if (!rooms.containsKey(code)) { send(c, "ERROR|Room does not exist"); return; }
+        moveClientToRoom(c, code);
+        send(c, "ROOM_JOINED|" + code);
+        broadcastRoom(code, "SYSTEM|" + c.username + " joined the room");
+        sendUserList(code);
+        log("JOIN   " + c.username + " -> " + code);
+        refreshTablesAsync();
+    }
+
+    private void leaveRoomCommand(InetAddress a, int port) {
+        ClientInfo c = requireClient(a, port); if (c == null) return;
+        leaveCurrentRoom(c, true);
+        refreshTablesAsync();
+    }
+
+    private void chat(InetAddress a, int port, String[] p) {
+        ClientInfo c = requireClient(a, port); if (c == null || c.room == null || p.length < 2) return;
+        String message = clean(p[1]);
+        if (!message.isBlank()) broadcastRoom(c.room, "CHAT|" + c.username + "|" + message);
+    }
+
+    private void attendance(InetAddress a, int port) {
+        ClientInfo c = requireClient(a, port); if (c == null || c.room == null) return;
+        Room r = rooms.get(c.room); if (r == null) return;
+        r.attendance.add(c.username);
+        broadcastRoom(c.room, "ATTENDANCE_OK|" + c.username + "|" + r.attendance.size());
+        refreshTablesAsync();
+    }
+
+    private void raiseHand(InetAddress a, int port) {
+        ClientInfo c = requireClient(a, port); if (c == null || c.room == null) return;
+        broadcastRoom(c.room, "RAISE_HAND|" + c.username);
+    }
+
+    private void startQuiz(InetAddress a, int port, String[] p) {
+        ClientInfo c = requireClient(a, port); if (c == null || c.room == null) return;
+        if (!"TEACHER".equals(c.role)) { send(c, "ERROR|Only TEACHER can start quiz"); return; }
+        if (p.length < 7) { send(c, "ERROR|Quiz data is incomplete"); return; }
+        int correct;
+        try { correct = Integer.parseInt(p[6]); } catch (Exception e) { correct = -1; }
+        if (correct < 0 || correct > 3) { send(c, "ERROR|Correct answer must be A-D"); return; }
+        Room r = rooms.get(c.room); if (r == null) return;
+        r.quiz = new Quiz(clean(p[1]), List.of(clean(p[2]), clean(p[3]), clean(p[4]), clean(p[5])), correct);
+        r.quizAnswers.clear();
+        broadcastRoom(c.room, "QUIZ|" + r.quiz.question + "|" + r.quiz.options.get(0) + "|" +
+                r.quiz.options.get(1) + "|" + r.quiz.options.get(2) + "|" + r.quiz.options.get(3));
+        log("QUIZ   Started in " + c.room + " by " + c.username);
+    }
+
+    private void quizAnswer(InetAddress a, int port, String[] p) {
+        ClientInfo c = requireClient(a, port); if (c == null || c.room == null || p.length < 2) return;
+        Room r = rooms.get(c.room); if (r == null || r.quiz == null) { send(c, "ERROR|No active quiz"); return; }
+        int ans;
+        try { ans = Integer.parseInt(p[1]); } catch (Exception e) { send(c, "ERROR|Invalid answer"); return; }
+        if (ans < 0 || ans > 3) { send(c, "ERROR|Invalid answer"); return; }
+        r.quizAnswers.put(c.username, ans);
+        boolean ok = ans == r.quiz.correctIndex;
+        send(c, "QUIZ_RESULT|" + (ok ? "CORRECT" : "WRONG") + "|" + r.quiz.options.get(r.quiz.correctIndex));
+        ClientInfo teacher = clients.get(r.teacher);
+        if (teacher != null) send(teacher, "QUIZ_PROGRESS|" + c.username + "|" + (ok ? "CORRECT" : "WRONG") + "|" + r.quizAnswers.size());
+    }
+
+    private ClientInfo validWebRtcTarget(ClientInfo sender, String targetName) {
+        ClientInfo target = clients.get(clean(targetName));
+        if (target == null) { send(sender, "ERROR|WebRTC target is not online"); return null; }
+        if (sender.room == null || target.room == null || !sender.room.equals(target.room)) {
+            send(sender, "ERROR|WebRTC target must be in the same room");
+            return null;
+        }
+        if (sender.username.equals(target.username)) { send(sender, "ERROR|Cannot call yourself"); return null; }
+        return target;
+    }
+
+    private void webRtcCall(InetAddress a, int port, String[] p) {
+        ClientInfo c = requireClient(a, port); if (c == null) return;
+        if (p.length < 2) { send(c, "ERROR|WebRTC target is required"); return; }
+        ClientInfo target = validWebRtcTarget(c, p[1]); if (target == null) return;
+        send(target, "WEBRTC_INCOMING|" + c.username);
+        send(c, "WEBRTC_CALLING|" + target.username);
+        log("WEBRTC " + c.username + " calling " + target.username + " in " + c.room);
+    }
+
+    private void webRtcAccept(InetAddress a, int port, String[] p) {
+        ClientInfo c = requireClient(a, port); if (c == null || p.length < 2) return;
+        ClientInfo target = validWebRtcTarget(c, p[1]); if (target == null) return;
+        send(target, "WEBRTC_ACCEPT|" + c.username);
+        log("WEBRTC " + c.username + " accepted call from " + target.username);
+    }
+
+    private void webRtcReject(InetAddress a, int port, String[] p) {
+        ClientInfo c = requireClient(a, port); if (c == null || p.length < 2) return;
+        ClientInfo target = validWebRtcTarget(c, p[1]); if (target == null) return;
+        send(target, "WEBRTC_REJECT|" + c.username);
+        log("WEBRTC " + c.username + " rejected call from " + target.username);
+    }
+
+    private void webRtcSignal(InetAddress a, int port, String[] p) {
+        ClientInfo c = requireClient(a, port); if (c == null) return;
+        if (p.length < 3) { send(c, "ERROR|WebRTC signal is incomplete"); return; }
+        ClientInfo target = validWebRtcTarget(c, p[1]); if (target == null) return;
+        send(target, "WEBRTC_SIGNAL|" + c.username + "|" + p[2]);
+    }
+
+    private void webRtcHangup(InetAddress a, int port, String[] p) {
+        ClientInfo c = requireClient(a, port); if (c == null || p.length < 2) return;
+        ClientInfo target = validWebRtcTarget(c, p[1]); if (target == null) return;
+        send(target, "WEBRTC_HANGUP|" + c.username);
+        log("WEBRTC " + c.username + " ended call with " + target.username);
+    }
+
+    private void webRtcClassCall(InetAddress a, int port) {
+        ClientInfo teacher = requireClient(a, port);
+        if (teacher == null) return;
+        if (!"TEACHER".equals(teacher.role)) { send(teacher, "ERROR|Only TEACHER can start online class"); return; }
+        if (teacher.room == null) { send(teacher, "ERROR|Please join a room first"); return; }
+        Room room = rooms.get(teacher.room);
+        if (room == null) { send(teacher, "ERROR|Room does not exist"); return; }
+
+        int invited = 0;
+        for (String name : new ArrayList<>(room.members)) {
+            ClientInfo student = clients.get(name);
+            if (student == null || student.username.equals(teacher.username)) continue;
+            if (!"STUDENT".equals(student.role)) continue;
+            send(student, "WEBRTC_CLASS_INCOMING|" + teacher.username + "|" + room.code);
+            invited++;
+        }
+        if (invited == 0) {
+            send(teacher, "ERROR|No students in room");
+            return;
+        }
+        send(teacher, "WEBRTC_CLASS_STARTED|" + invited);
+        log("WEBRTC CLASS " + teacher.username + " invited " + invited + " student(s) in " + room.code);
+    }
+
+    private void webRtcClassAccept(InetAddress a, int port, String[] p) {
+        ClientInfo student = requireClient(a, port);
+        if (student == null || p.length < 2) return;
+        if (!"STUDENT".equals(student.role)) { send(student, "ERROR|Only STUDENT can accept online class"); return; }
+        ClientInfo teacher = validWebRtcTarget(student, p[1]);
+        if (teacher == null) return;
+        if (!"TEACHER".equals(teacher.role)) { send(student, "ERROR|Online class host must be TEACHER"); return; }
+        send(teacher, "WEBRTC_CLASS_ACCEPTED|" + student.username);
+        send(student, "WEBRTC_CLASS_JOINED|" + teacher.username);
+        log("WEBRTC CLASS " + student.username + " joined class of " + teacher.username + " in " + student.room);
+    }
+
+    private void webRtcClassReject(InetAddress a, int port, String[] p) {
+        ClientInfo student = requireClient(a, port);
+        if (student == null || p.length < 2) return;
+        ClientInfo teacher = validWebRtcTarget(student, p[1]);
+        if (teacher == null) return;
+        send(teacher, "WEBRTC_CLASS_REJECTED|" + student.username);
+        log("WEBRTC CLASS " + student.username + " rejected class invitation from " + teacher.username);
+    }
+
+    private void webRtcClassEnd(InetAddress a, int port) {
+        ClientInfo teacher = requireClient(a, port);
+        if (teacher == null) return;
+        if (!"TEACHER".equals(teacher.role)) { send(teacher, "ERROR|Only TEACHER can end online class"); return; }
+        if (teacher.room == null) return;
+        Room room = rooms.get(teacher.room);
+        if (room == null) return;
+        for (String name : new ArrayList<>(room.members)) {
+            if (name.equals(teacher.username)) continue;
+            ClientInfo c = clients.get(name);
+            if (c != null) send(c, "WEBRTC_CLASS_ENDED|" + teacher.username);
+        }
+        send(teacher, "WEBRTC_CLASS_ENDED|" + teacher.username);
+        log("WEBRTC CLASS " + teacher.username + " ended online class in " + room.code);
+    }
+
+    private void logout(InetAddress a, int port) {
+        ClientInfo c = byEndpoint(a, port); if (c == null) return;
+        leaveCurrentRoom(c, false);
+        clients.remove(c.username);
+        send(a, port, "LOGOUT_OK");
+        log("LOGOUT " + c.username);
+        refreshTablesAsync();
+    }
+
+    private void moveClientToRoom(ClientInfo c, String room) {
+        if (c.room != null && !c.room.equals(room)) leaveCurrentRoom(c, false);
+        c.room = room;
+        c.lastSeen = System.currentTimeMillis();
+        rooms.get(room).members.add(c.username);
+    }
+
+    private void leaveCurrentRoom(ClientInfo c, boolean notify) {
+        if (c.room == null) { if (notify) send(c, "ROOM_LEFT|"); return; }
+        String old = c.room;
+        Room r = rooms.get(old);
+        if (r != null && "TEACHER".equals(c.role) && c.username.equals(r.teacher)) {
+            for (String name : new ArrayList<>(r.members)) {
+                if (name.equals(c.username)) continue;
+                ClientInfo member = clients.get(name);
+                if (member != null) send(member, "WEBRTC_CLASS_ENDED|" + c.username);
+            }
+        }
+        if (r != null) {
+            r.members.remove(c.username);
+            r.attendance.remove(c.username);
+        }
+        c.room = null;
+        if (notify) send(c, "ROOM_LEFT|" + old);
+        broadcastRoom(old, "SYSTEM|" + c.username + " left the room");
+        sendUserList(old);
+        if (r != null && r.members.isEmpty()) rooms.remove(old);
+    }
+
+    private void kickSelectedUser() {
+        int row = userTable.getSelectedRow();
+        if (row < 0) { JOptionPane.showMessageDialog(this, "Vui lòng chọn một người dùng trước."); return; }
+        String username = String.valueOf(userModel.getValueAt(row, 0));
+        ClientInfo c = clients.get(username);
+        if (c == null) return;
+        String reason = JOptionPane.showInputDialog(this, "Lý do mời " + username + " ra khỏi lớp:", "Quản trị viên Server");
+        if (reason == null) return;
+        send(c, "KICKED|" + clean(reason));
+        leaveCurrentRoom(c, false);
+        clients.remove(username);
+        log("QUẢN TRỊ  Đã mời " + username + " ra khỏi lớp | " + clean(reason));
+        refreshTables();
+    }
+
+    private void broadcastDialog() {
+        if (!running) { JOptionPane.showMessageDialog(this, "Vui lòng khởi động Server trước."); return; }
+        String msg = JOptionPane.showInputDialog(this, "Nhập thông báo gửi đến tất cả người dùng đang kết nối:");
+        if (msg == null || clean(msg).isBlank()) return;
+        broadcastAll("ANNOUNCEMENT|" + clean(msg));
+        log("QUẢN TRỊ  Thông báo toàn hệ thống: " + clean(msg));
+    }
+
+    private void closeSelectedRoom() {
+        int row = roomTable.getSelectedRow();
+        if (row < 0) { JOptionPane.showMessageDialog(this, "Vui lòng chọn một phòng trước."); return; }
+        String code = String.valueOf(roomModel.getValueAt(row, 0));
+        int yes = JOptionPane.showConfirmDialog(this, "Bạn có chắc muốn đóng phòng " + code + "?", "Đóng phòng", JOptionPane.YES_NO_OPTION);
+        if (yes != JOptionPane.YES_OPTION) return;
+        Room r = rooms.remove(code);
+        if (r != null) {
+            for (String username : new ArrayList<>(r.members)) {
+                ClientInfo c = clients.get(username);
+                if (c != null) {
+                    c.room = null;
+                    send(c, "ROOM_CLOSED|" + code + "|Closed by server administrator");
+                }
+            }
+        }
+        log("QUẢN TRỊ  Đã đóng phòng " + code);
+        refreshTables();
+    }
+
+    private void removeOfflineClients() {
+        if (!running) return;
+        long now = System.currentTimeMillis();
+        for (ClientInfo c : new ArrayList<>(clients.values())) {
+            if (now - c.lastSeen > OFFLINE_TIMEOUT_MS) {
+                leaveCurrentRoom(c, false);
+                clients.remove(c.username);
+                log("OFFLINE " + c.username + " timed out");
+            }
+        }
+    }
+
+    private ClientInfo requireClient(InetAddress a, int port) {
+        ClientInfo c = byEndpoint(a, port);
+        if (c == null) send(a, port, "ERROR|Please login first");
+        else c.lastSeen = System.currentTimeMillis();
+        return c;
+    }
+
+    private ClientInfo byEndpoint(InetAddress a, int port) {
+        for (ClientInfo c : clients.values()) if (c.port == port && c.address.equals(a)) return c;
+        return null;
+    }
+
+    private void sendUserList(String roomCode) {
+        Room r = rooms.get(roomCode); if (r == null) return;
+        List<String> list = new ArrayList<>();
+        for (String name : r.members) {
+            ClientInfo c = clients.get(name);
+            if (c != null) list.add(c.username + ":" + c.role);
+        }
+        Collections.sort(list);
+        broadcastRoom(roomCode, "USER_LIST|" + String.join(",", list));
+    }
+
+    private void broadcastRoom(String room, String message) {
+        Room r = rooms.get(room); if (r == null) return;
+        for (String user : new ArrayList<>(r.members)) {
+            ClientInfo c = clients.get(user);
+            if (c != null) send(c, message);
+        }
+    }
+
+    private void broadcastAll(String message) {
+        for (ClientInfo c : new ArrayList<>(clients.values())) send(c, message);
+    }
+
+    private void send(ClientInfo c, String message) { send(c.address, c.port, message); }
+
+    private void send(InetAddress address, int port, String message) {
+        if (socket == null || socket.isClosed()) return;
+        try {
+            byte[] data = message.getBytes(StandardCharsets.UTF_8);
+            socket.send(new DatagramPacket(data, data.length, address, port));
+        } catch (Exception e) { log("Send error: " + e.getMessage()); }
+    }
+
+    private void refreshTablesAsync() { SwingUtilities.invokeLater(this::refreshTables); }
+
+    private void refreshTables() {
+        String selectedUsername = null;
+        int selectedUserRow = userTable.getSelectedRow();
+        if (selectedUserRow >= 0 && selectedUserRow < userModel.getRowCount()) {
+            selectedUsername = String.valueOf(userModel.getValueAt(selectedUserRow, 0));
+        }
+
+        String selectedRoomCode = null;
+        int selectedRoomRow = roomTable.getSelectedRow();
+        if (selectedRoomRow >= 0 && selectedRoomRow < roomModel.getRowCount()) {
+            selectedRoomCode = String.valueOf(roomModel.getValueAt(selectedRoomRow, 0));
+        }
+
+        lblClientCount.setText(String.valueOf(clients.size()));
+        lblRoomCount.setText(String.valueOf(rooms.size()));
+
+        userModel.setRowCount(0);
+        List<ClientInfo> userList = new ArrayList<>(clients.values());
+        userList.sort(Comparator.comparing(x -> x.username));
+        int userRowToRestore = -1;
+        for (ClientInfo c : userList) {
+            long sec = Math.max(0, (System.currentTimeMillis() - c.lastSeen) / 1000);
+            userModel.addRow(new Object[]{c.username, displayRole(c.role), c.address.getHostAddress(), c.port,
+                    c.room == null ? "-" : c.room, sec + " giây trước"});
+            if (selectedUsername != null && selectedUsername.equals(c.username)) {
+                userRowToRestore = userModel.getRowCount() - 1;
+            }
+        }
+        if (userRowToRestore >= 0) {
+            userTable.setRowSelectionInterval(userRowToRestore, userRowToRestore);
+        }
+
+        roomModel.setRowCount(0);
+        List<Room> roomList = new ArrayList<>(rooms.values());
+        roomList.sort(Comparator.comparing(x -> x.code));
+        int roomRowToRestore = -1;
+        for (Room r : roomList) {
+            roomModel.addRow(new Object[]{r.code, r.teacher, r.members.size(), r.attendance.size()});
+            if (selectedRoomCode != null && selectedRoomCode.equals(r.code)) {
+                roomRowToRestore = roomModel.getRowCount() - 1;
+            }
+        }
+        if (roomRowToRestore >= 0) {
+            roomTable.setRowSelectionInterval(roomRowToRestore, roomRowToRestore);
+        }
+    }
+
+    private void log(String s) {
+        String line = "[" + LocalDateTime.now().format(CLOCK) + "] " + s;
+        SwingUtilities.invokeLater(() -> {
+            logArea.append(line + "\n");
+            logArea.setCaretPosition(logArea.getDocument().getLength());
+        });
+    }
+
+    private String displayRole(String role) {
+        return "TEACHER".equals(role) ? "GIÁO VIÊN" : "HỌC SINH";
+    }
+
+    private String clean(String s) {
+        if (s == null) return "";
+        return s.trim().replace("|", "/").replace("\r", " ").replace("\n", " ");
+    }
+    private String findLanIp() {
+        String wifiCandidate = null;
+        String ethernetCandidate = null;
+        String fallbackCandidate = null;
+
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface ni = interfaces.nextElement();
+
+                if (!ni.isUp() || ni.isLoopback()) {
+                    continue;
+                }
+
+                String adapterName = ((ni.getName() == null ? "" : ni.getName()) + " "
+                        + (ni.getDisplayName() == null ? "" : ni.getDisplayName()))
+                        .toLowerCase(Locale.ROOT);
+
+                boolean virtualAdapter = ni.isVirtual()
+                        || adapterName.contains("virtualbox")
+                        || adapterName.contains("vmware")
+                        || adapterName.contains("hyper-v")
+                        || adapterName.contains("host-only")
+                        || adapterName.contains("vethernet")
+                        || adapterName.contains("docker")
+                        || adapterName.contains("wsl")
+                        || adapterName.contains("loopback")
+                        || adapterName.contains("tunnel")
+                        || adapterName.contains("teredo");
+
+                if (virtualAdapter) {
+                    continue;
+                }
+
+                Enumeration<InetAddress> addrs = ni.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    InetAddress address = addrs.nextElement();
+
+                    if (!(address instanceof Inet4Address)) {
+                        continue;
+                    }
+                    if (address.isLoopbackAddress() || address.isLinkLocalAddress()) {
+                        continue;
+                    }
+                    if (!address.isSiteLocalAddress()) {
+                        continue;
+                    }
+
+                    String ip = address.getHostAddress();
+
+                    boolean isWifi = adapterName.contains("wi-fi")
+                            || adapterName.contains("wifi")
+                            || adapterName.contains("wireless")
+                            || adapterName.contains("wlan")
+                            || adapterName.contains("802.11");
+
+                    boolean isEthernet = adapterName.contains("ethernet")
+                            || adapterName.matches(".*\\beth[0-9]*\\b.*");
+
+                    if (isWifi && wifiCandidate == null) {
+                        wifiCandidate = ip;
+                    } else if (isEthernet && ethernetCandidate == null) {
+                        ethernetCandidate = ip;
+                    } else if (fallbackCandidate == null) {
+                        fallbackCandidate = ip;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log("Không thể tự nhận diện IP LAN: " + e.getMessage());
+        }
+
+        if (wifiCandidate != null) return wifiCandidate;
+        if (ethernetCandidate != null) return ethernetCandidate;
+        if (fallbackCandidate != null) return fallbackCandidate;
+        return "127.0.0.1";
+    }
+
+    private static class ClientInfo {
+        final String username, role;
+        final InetAddress address;
+        final int port;
+        volatile String room;
+        volatile long lastSeen = System.currentTimeMillis();
+        ClientInfo(String u, String r, InetAddress a, int p) { username = u; role = r; address = a; port = p; }
+    }
+
+    private static class Room {
+        final String code, teacher;
+        final Set<String> members = ConcurrentHashMap.newKeySet();
+        final Set<String> attendance = ConcurrentHashMap.newKeySet();
+        final Map<String, Integer> quizAnswers = new ConcurrentHashMap<>();
+        volatile Quiz quiz;
+        Room(String c, String t) { code = c; teacher = t; }
+    }
+
+    private static class Quiz {
+        final String question;
+        final List<String> options;
+        final int correctIndex;
+        Quiz(String q, List<String> o, int c) { question = q; options = o; correctIndex = c; }
+    }
+}

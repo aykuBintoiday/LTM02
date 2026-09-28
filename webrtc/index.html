@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Classroom - Gọi Video WebRTC</title>
+<style>
+*{box-sizing:border-box}body{font-family:Segoe UI,Arial,sans-serif;background:#f4f6fb;color:#192a46;margin:0}.top{background:#192a46;color:#fff;padding:18px 24px;display:flex;justify-content:space-between;align-items:center;gap:16px}.top b{font-size:18px}.status{font-size:13px;background:#ffffff1a;padding:7px 12px;border-radius:999px}.wrap{max-width:1180px;margin:auto;padding:20px}.callinfo{background:#fff;border:1px solid #e1e6ef;border-radius:12px;padding:14px 16px;margin-bottom:16px;display:flex;gap:24px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.card{background:#fff;border:1px solid #e1e6ef;border-radius:12px;padding:16px;box-shadow:0 4px 18px #0000000d}video{width:100%;background:#111;border-radius:10px;aspect-ratio:16/9}button{padding:11px 15px;border:0;border-radius:8px;background:#3474eb;color:#fff;font-weight:700;margin:4px;cursor:pointer}button.secondary{background:#e9eef7;color:#192a46}button.danger{background:#d92d20}button:disabled{opacity:.5;cursor:not-allowed}.hint{color:#667085;font-size:13px;line-height:1.5}.ok{color:#16803c}.warn{color:#b54708}.error{color:#b42318}.controls{margin-top:16px;text-align:center}@media(max-width:800px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
+</style>
+</head>
+<body>
+<div class="top"><b>LỚP HỌC TRỰC TUYẾN - WEBRTC</b><span class="status" id="status">Đang khởi tạo...</span></div>
+<div class="wrap">
+  <div class="callinfo">
+    <div><b>Tài khoản:</b> <span id="me">-</span></div>
+    <div><b>Phòng:</b> <span id="room">-</span></div>
+    <div><b>Đang gọi:</b> <span id="peer">-</span></div>
+  </div>
+  <div class="grid">
+    <div class="card"><h3>Camera của tôi</h3><video id="local" autoplay muted playsinline></video><p class="hint">Trình duyệt sẽ hỏi quyền Camera/Microphone. Hãy chọn <b>Cho phép</b>.</p></div>
+    <div class="card"><h3>Camera người bên kia</h3><video id="remote" autoplay playsinline></video><p class="hint">Video sẽ hiện tự động sau khi WebRTC kết nối thành công.</p></div>
+  </div>
+  <div class="card controls">
+    <button id="start">Bật Camera / Microphone</button>
+    <button id="call" disabled>Bắt đầu cuộc gọi</button>
+    <button id="hangup" class="danger">Kết thúc cuộc gọi</button>
+    <p class="hint" id="help">Signaling WebRTC được chuyển qua UDP Server của Smart Classroom; âm thanh/video sau đó truyền trực tiếp P2P giữa hai trình duyệt.</p>
+  </div>
+</div>
+<script>
+let info={username:'',target:'',room:'',mode:'caller'};
+let pc=null, stream=null, pendingOffer=null, pollTimer=null, callStarted=false;
+const local=document.getElementById('local'), remote=document.getElementById('remote');
+const statusEl=document.getElementById('status'), btnStart=document.getElementById('start'), btnCall=document.getElementById('call');
+function setStatus(t,cls=''){statusEl.textContent=t;statusEl.className='status '+cls;}
+async function loadInfo(){
+  const r=await fetch('/info',{cache:'no-store'}); info=await r.json();
+  document.getElementById('me').textContent=info.username||'-'; document.getElementById('peer').textContent=info.target||'-'; document.getElementById('room').textContent=info.room||'-';
+  btnCall.textContent=info.mode==='caller'?'Bắt đầu cuộc gọi':'Đang chờ lời mời...';
+  btnCall.disabled=info.mode!=='caller' || !stream;
+  setStatus(info.mode==='caller'?'Sẵn sàng gọi '+info.target:'Đã chấp nhận cuộc gọi từ '+info.target);
+}
+function makePc(){
+  if(pc) return pc;
+  pc=new RTCPeerConnection({iceServers:[]});
+  if(stream) stream.getTracks().forEach(t=>pc.addTrack(t,stream));
+  pc.ontrack=e=>{remote.srcObject=e.streams[0];};
+  pc.onconnectionstatechange=()=>{
+    const s=pc.connectionState;
+    if(s==='connected') setStatus('Đã kết nối WebRTC','ok');
+    else if(s==='failed'||s==='disconnected') setStatus('Kết nối WebRTC gặp sự cố','error');
+    else setStatus('WebRTC: '+s);
+  };
+  return pc;
+}
+async function startMedia(){
+  try{
+    if(!stream){stream=await navigator.mediaDevices.getUserMedia({video:true,audio:true});local.srcObject=stream;}
+    makePc(); btnStart.disabled=true;
+    if(info.mode==='caller'){btnCall.disabled=false;setStatus('Camera đã bật - nhấn Bắt đầu cuộc gọi','ok');}
+    else {setStatus('Camera đã bật - đang chờ Offer','ok'); if(pendingOffer){const x=pendingOffer;pendingOffer=null;await acceptOffer(x);}}
+  }catch(e){setStatus('Không mở được Camera/Microphone','error');alert('Không mở được Camera/Microphone. Hãy cấp quyền cho trình duyệt.\n\n'+e);}
+}
+function waitIceComplete(peer){
+  if(peer.iceGatheringState==='complete') return Promise.resolve();
+  return new Promise(resolve=>{let done=false;const finish=()=>{if(done)return;done=true;peer.removeEventListener('icegatheringstatechange',check);resolve();};const check=()=>{if(peer.iceGatheringState==='complete')finish();};peer.addEventListener('icegatheringstatechange',check);setTimeout(finish,3500);});
+}
+async function postSignal(obj){
+  const r=await fetch('/signal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});
+  if(!r.ok) throw new Error(await r.text());
+}
+async function makeOffer(){
+  if(!stream) await startMedia();
+  try{
+    makePc(); await pc.setLocalDescription(await pc.createOffer()); await waitIceComplete(pc);
+    await postSignal({type:'offer',sdp:pc.localDescription.sdp}); callStarted=true; btnCall.disabled=true; setStatus('Đã gửi lời mời WebRTC - chờ phản hồi...');
+  }catch(e){setStatus('Không tạo được cuộc gọi','error');alert(e);}
+}
+async function acceptOffer(sig){
+  if(!stream){pendingOffer=sig;setStatus('Có Offer - hãy bật Camera/Microphone','warn');return;}
+  try{
+    makePc(); await pc.setRemoteDescription({type:'offer',sdp:sig.sdp});
+    await pc.setLocalDescription(await pc.createAnswer()); await waitIceComplete(pc);
+    await postSignal({type:'answer',sdp:pc.localDescription.sdp}); callStarted=true; setStatus('Đã gửi phản hồi WebRTC - đang kết nối...');
+  }catch(e){setStatus('Không nhận được cuộc gọi','error');console.error(e);}
+}
+async function handleSignal(sig){
+  if(!sig||!sig.type)return;
+  if(sig.type==='offer'){await acceptOffer(sig);}
+  else if(sig.type==='answer'){
+    try{makePc();await pc.setRemoteDescription({type:'answer',sdp:sig.sdp});setStatus('Đã nhận phản hồi - đang kết nối...');}catch(e){setStatus('Lỗi áp dụng Answer','error');console.error(e);}
+  }else if(sig.type==='hangup'){endLocal(false);setStatus('Người bên kia đã kết thúc cuộc gọi','warn');}
+}
+async function pollSignals(){
+  try{const r=await fetch('/signal',{cache:'no-store'});if(r.status===200){const sig=await r.json();await handleSignal(sig);}}catch(e){}
+}
+function endLocal(notify=true){
+  if(notify) fetch('/hangup',{method:'POST'}).catch(()=>{});
+  if(pc){pc.close();pc=null;} if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;} local.srcObject=null;remote.srcObject=null;btnStart.disabled=false;btnCall.disabled=true;callStarted=false;
+}
+btnStart.onclick=startMedia; btnCall.onclick=makeOffer; document.getElementById('hangup').onclick=()=>{endLocal(true);setStatus('Đã kết thúc cuộc gọi');};
+window.addEventListener('beforeunload',()=>{if(callStarted)navigator.sendBeacon('/hangup','1');});
+(async()=>{try{await loadInfo();pollTimer=setInterval(pollSignals,600);}catch(e){setStatus('Không kết nối được với ứng dụng Smart Classroom','error');}})();
+</script>
+</body>
+</html>
